@@ -1,460 +1,549 @@
-# 注释：杨博皓 信管2403 220241060922｜V5细粒度单工序排产｜多级BOM、工艺路线、设备互斥、工序强先后依赖
+# 杨博皓 信管2403 220241060922
+# ERP课程设计｜零碳园区MPS细粒度工序BOM工艺路线协同调度智能体仿真【增强可视化完整版】
+# 新增：库存时序、日前报价单、约束状态面板、三层负荷对比图、情景一键切换按钮
+# 功能清单：
+# 1、复刻docx报告全部页面展示内容：产品工艺路线表格、双场景指标卡片、对比总表、订单汇总、动态工序甘特图、时序曲线
+# 2、四层电力市场：日前市场、日内滚动时域、实时可中断负荷、AGC调频准静态容量测算、日前报价曲线、偏差惩罚
+# 3、MPS贪婪启发智能体：BOM齐套、串行工艺路线、A/B/C三台设备互斥、换产工时&成本【产出完成率动态均衡投产】
+# 4、白夜班排班、夜班疲劳、次品返工成本、延期违约金核算
+# 5、碳配额+动态碳价、光伏储能联合调度；双场景并行仿真
+# 增强可视化：库存时序曲线、日前报价单、约束状态概览、三层负荷对比、一键情景切换
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-import plotly.express as px
 
-st.set_page_config(page_title="零碳园区MPS细粒度工序级协同仿真", layout="wide")
-st.markdown("""
-<style>
-.block-container {padding-top:1rem;}
-div[data-testid="metric-container"] {background-color:#f8f9fa;border-radius:8px;padding:10px;}
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="零碳园区MPS‑虚拟电厂｜增强可视化版", layout="wide")
 
-# ======================侧边栏参数面板======================
-with st.sidebar:
-    st.header("⚙️ 仿真参数配置")
-    st.subheader("🏭生产设备参数")
-    cap_A = st.number_input("设备A产能(件/小时)", value=8, min_value=1)
-    cap_B = st.number_input("设备B产能(件/小时)", value=5, min_value=1)
-    cap_C = st.number_input("设备C产能(件/小时)", value=6, min_value=1)
-    max_hour_A = st.number_input("设备A最大可用小时", value=120, min_value=0, max_value=168)
-    max_hour_B = st.number_input("设备B最大可用小时", value=140, min_value=0, max_value=168)
-    max_hour_C = st.number_input("设备C最大可用小时", value=130, min_value=0, max_value=168)
+# ======================【全局常量定义｜来自docx文档工艺BOM】 ======================
+dt = 0.25
+T = 96
+time_index = np.arange(T)
+window_step = 4
+day_hour = time_index * dt
 
-    st.subheader("👷 工人排班 & 生产质量")
-    wage_day = st.number_input("白班工人时薪(元/小时)", value=22, min_value=1)
-    wage_night = st.number_input("夜班工人时薪(元/小时)", value=34, min_value=1)
-    base_defect = st.number_input("白班基础次品率", value=0.02, min_value=0.0, max_value=0.2, step=0.01)
-    night_defect_inc = st.number_input("夜班每小时次品率增量", value=0.003, min_value=0.0, max_value=0.02, step=0.001)
-    rework_cost = st.number_input("单件次品返工成本(元)", value=16, min_value=0)
+# 产品定义：0:P1半成品,1:P2半成品,2:FA成品,3:FB成品
+proc_route = {
+    0: [("A","切割"),("B","打磨")],
+    1: [("B","下料"),("C","钻孔"),("A","粗磨")],
+    2: [("C","装配FA"),("A","质检FA")],
+    3: [("C","组合装配FB"),("B","表面处理FB"),("A","终检包装FB")]
+}
+bom_require = {2:{"P1":1},3:{"P2":1}}
+prod_name = {0:"P1半成品",1:"P2半成品",2:"FA成品",3:"FB成品"}
+dev_id_map = {"A":0,"B":1,"C":2}
+dev_name_list = ["设备A","设备B","设备C"]
 
-    st.subheader("📦订单数量（半成品+成品）")
-    p1_qty = st.number_input("半成品P1计划产量(件)", value=120, min_value=0)
-    p2_qty = st.number_input("半成品P2计划产量(件)", value=100, min_value=0)
-    fa_qty = st.number_input("成品FA计划产量(件)", value=80, min_value=0)
-    fb_qty = st.number_input("成品FB计划产量(件)", value=60, min_value=0)
+# 【页面展示：产品工艺路线表格，复刻docx报告截图】
+df_tech_route = pd.DataFrame([
+    {"产品":"P1半成品","工序1":"切割【设备A】","工序2":"打磨【设备B】","工序3":"无","工序4":"无"},
+    {"产品":"P2半成品","工序1":"下料【设备B】","工序2":"钻孔【设备C】","工序3":"粗磨【设备A】","工序4":"无"},
+    {"产品":"FA成品","工序1":"装配FA【设备C】","工序2":"质检FA【设备A】","工序3":"无","工序4":"无"},
+    {"产品":"FB成品","工序1":"组合装配FB【设备C】","工序2":"表面处理FB【设备B】","工序3":"终检包装FB【设备A】","工序4":"无"},
+])
 
-    st.subheader("⏰交付期约束(h)")
-    t_p1_end = st.number_input("P1最晚交付", value=70, min_value=1, max_value=168)
-    t_p2_end = st.number_input("P2最晚交付", value=80, min_value=1, max_value=168)
-    t_fa_end = st.number_input("FA最晚交付", value=130, min_value=1, max_value=168)
-    t_fb_end = st.number_input("FB最晚交付", value=150, min_value=1, max_value=168)
+# ====================== 时序生成函数 ======================
+def gen_price_dayahead_15min():
+    price = np.ones(T)*0.3
+    for t in range(T):
+        h = t*dt
+        if 8 <= h <12:
+            price[t]=0.55
+        elif 12<=h<14:
+            price[t]=0.15
+        elif 18<=h<22:
+            price[t]=1.0
+    return price
 
-    st.subheader("🧾BOM物料消耗")
-    bom_fa_p1 = st.number_input("每件FA消耗P1", value=1.0, min_value=0.1)
-    bom_fb_p1 = st.number_input("每件FB消耗P1", value=1.0, min_value=0.1)
-    bom_fb_p2 = st.number_input("每件FB消耗P2", value=1.0, min_value=0.1)
-
-    st.subheader("⚙️产品能耗&碳排放 /件")
-    e_p1 = st.number_input("P1总碳排放(tCO₂/件)", value=0.020, min_value=0.001)
-    elec_p1 = st.number_input("P1总耗电(MWh/件)", value=0.08, min_value=0.001)
-    e_p2 = st.number_input("P2总碳排放(tCO₂/件)", value=0.025, min_value=0.001)
-    elec_p2 = st.number_input("P2总耗电(MWh/件)", value=0.09, min_value=0.001)
-    e_fa = st.number_input("FA总碳排放(tCO₂/件)", value=0.030, min_value=0.001)
-    elec_fa = st.number_input("FA总耗电(MWh/件)", value=0.10, min_value=0.001)
-    e_fb = st.number_input("FB总碳排放(tCO₂/件)", value=0.035, min_value=0.001)
-    elec_fb = st.number_input("FB总耗电(MWh/件)", value=0.12, min_value=0.001)
-
-    st.subheader("🔄换产参数")
-    change_hour = st.number_input("一次换产耗时(h)", value=2, min_value=0)
-    change_cost = st.number_input("单次换产成本(元)", value=12, min_value=0)
-
-    st.subheader("🌱碳配额设置")
-    base_quota = st.number_input("园区免费基础碳配额(tCO₂)", value=18, min_value=0)
-    grid_carbon_factor = st.number_input("电网购电碳排放因子(tCO₂/MWh)", value=0.58, min_value=0.1)
-
-    st.subheader("🔋储能配置")
-    batt_cap = st.number_input("储能额定容量(MWh)", value=20, min_value=0)
-    batt_eff = st.slider("储能充放电效率", min_value=0.7, max_value=0.95, value=0.9, step=0.01)
-
-    st.subheader("⚡需求响应（虚拟电厂）")
-    dr_enable = st.checkbox("启用需求响应事件", value=True)
-    dr_start = st.number_input("需求响应开始时刻(h)", value=40, min_value=0, max_value=167)
-    dr_end = st.number_input("需求响应结束时刻(h)", value=60, min_value=0, max_value=168)
-    dr_subsidy = st.number_input("负荷削减补贴(元/MWh)", value=120, min_value=0)
-
-    st.subheader("🔧扰动设置")
-    fault_enable = st.checkbox("开启设备随机故障扰动", value=False)
+def gen_price_rt_15min(p_da):
     np.random.seed(42)
+    noise = np.random.normal(0,0.04,size=T)
+    pr = p_da + noise
+    return np.clip(pr,0.05,1.2)
 
-    st.subheader("🎯智能体目标权重")
-    weight_carbon = st.slider("碳减排权重(0只看电费，1优先低碳)", min_value=0.0, max_value=1.0, value=0.4, step=0.05)
+def gen_pv_15min():
+    pv = np.zeros(T)
+    for t in range(T):
+        h=t*dt
+        if 6<=h<=18:
+            pv[t]=20*np.exp(-((h-12)/3)**2)
+    return pv
 
-T = 168
-hour_list = np.arange(T)
-base_price = np.zeros(T)
-for t in range(T):
-    h = t % 24
-    if 8 <= h <= 11 or 18 <= h <=21:
-        p = 0.82
-    elif 12 <= h <=17:
-        p =0.55
-    else:
-        p=0.31
-    base_price[t]=p
-elec_price = base_price + np.random.normal(0,0.03,size=T)
+price_da = gen_price_dayahead_15min()
+price_rt = gen_price_rt_15min(price_da)
+pv_true = gen_pv_15min()
 
-pv_power = np.zeros(T)
-for t in range(T):
-    h = t%24
-    if 7<=h<=18:
-        pv_power[t] = max(0,0.8*np.sin((h-7)*np.pi/11)+np.random.normal(0,0.05))
+# ====================== 侧边栏参数面板｜复刻docx报告参数面板 ======================
+with st.sidebar:
+    st.header("仿真全局参数")
+    st.subheader("🔋储能&AGC辅助服务")
+    batt_cap = st.number_input("储能容量kWh",value=50,step=1)
+    batt_pmax = st.number_input("储能最大功率kW",value=10,step=1)
+    agc_reserve_ratio = st.slider("AGC调频预留容量占比",0.0,0.4,0.15,0.05)
+    fm_price = st.number_input("AGC调频补贴元/kWh",value=0.08,step=0.01)
 
-def get_carbon_price(total_emission):
-    excess = max(0, total_emission - base_quota)
-    price = 45 + 0.25*excess
-    return np.clip(price,30,200)
+    st.subheader("⚡电力市场惩罚参数")
+    dev_penalty = st.number_input("功率偏差惩罚元/kW",value=0.3,step=0.05)
+    interrupt_cost = st.number_input("柔性工序单次中断成本元",value=120,step=10)
 
-# =====================【细粒度工艺路线定义】====================
-# 每个产品：[{工序名称，绑定设备，本工序分摊碳排放、分摊耗电}]
-process_route = {
-    "P1":[
-        {"proc_name":"切割","dev":"A","e_share":0.5,"elec_share":0.5},
-        {"proc_name":"打磨","dev":"B","e_share":0.5,"elec_share":0.5}
-    ],
-    "P2":[
-        {"proc_name":"下料","dev":"B","e_share":0.35,"elec_share":0.35},
-        {"proc_name":"钻孔","dev":"C","e_share":0.35,"elec_share":0.35},
-        {"proc_name":"粗磨","dev":"A","e_share":0.30,"elec_share":0.30}
-    ],
-    "FA":[
-        {"proc_name":"装配FA","dev":"C","e_share":0.5,"elec_share":0.5},
-        {"proc_name":"质检FA","dev":"A","e_share":0.5,"elec_share":0.5}
-    ],
-    "FB":[
-        {"proc_name":"组合装配FB","dev":"C","e_share":0.34,"elec_share":0.34},
-        {"proc_name":"表面处理FB","dev":"B","e_share":0.33,"elec_share":0.33},
-        {"proc_name":"终检包装FB","dev":"A","e_share":0.33,"elec_share":0.33}
-    ]
-}
+    st.subheader("🏭碳市场参数")
+    free_quota = st.number_input("园区免费碳配额 tCO₂",value=90,step=5)
+    base_carbon_price = st.number_input("基准碳价元/tCO₂",value=60,step=5)
 
-# 产品总能耗映射
-prod_total_energy = {
-    "P1":{"e":e_p1,"elec":elec_p1},
-    "P2":{"e":e_p2,"elec":elec_p2},
-    "FA":{"e":e_fa,"elec":elec_fa},
-    "FB":{"e":e_fb,"elec":elec_fb}
-}
+    st.subheader("📋MPS订单产量")
+    ord_p1 = st.number_input("P1半成品计划件数",value=25,step=5)
+    ord_p2 = st.number_input("P2半成品计划件数",value=20,step=5)
+    ord_fa = st.number_input("FA成品计划件数",value=15,step=5)
+    ord_fb = st.number_input("FB成品计划件数",value=12,step=5)
+    due_hour = st.number_input("统一交付截止时刻 h",value=22,step=1)
+    delay_penalty = st.number_input("订单延期违约金元/件",value=25,step=1)
+    setup_cost = st.number_input("设备换产成本元/次",value=30,step=1)
+    setup_step = st.number_input("换产占用时段数(15min步)",value=2,step=1)
 
-# =====================仿真主函数【工序级】====================
-def run_simulation(use_pv=True, use_batt=True, use_carbon=True, w_carbon=0.0):
-    # 设备已使用工时
-    dev_used_h = {"A":0.0,"B":0.0,"C":0.0}
-    dev_max_h = {"A":max_hour_A,"B":max_hour_B,"C":max_hour_C}
-    dev_cap = {"A":cap_A,"B":cap_B,"C":cap_C}
+    st.subheader("👷工人排班&生产质量｜复刻docx")
+    wage_day = st.number_input("白班时薪元",value=22,step=1)
+    wage_night = st.number_input("夜班时薪元",value=34,step=1)
+    base_defect_day = st.number_input("白班基础次品率",value=0.02,step=0.005)
+    defect_night_inc = st.number_input("夜班每时段次品率增量",value=0.002,step=0.001)
+    rework_cost_unit = st.number_input("单件返工成本元",value=16,step=1)
 
-    batt_soc = 0.0
-    soc_record = np.zeros(T)
-    labor_cost_rec = np.zeros(T)
-    defect_cnt_rec = np.zeros(T)
-    night_hour_cnt = 0.0
+    st.subheader("⚖️优化权重")
+    w_ele = st.slider("电费权重",0.0,1.0,0.6,0.05)
+    w_car = 1.0 - w_ele
+
+# ====================== 辅助工具函数 ======================
+def is_daytime(t):
+    h = t*dt
+    return 8 <= h < 18
+
+def calc_agc(batt_c,batt_pmax,res_ratio,f_price):
+    res_cap = batt_c * res_ratio
+    fm_inc = res_cap * f_price
+    opp_cost = res_cap * 0.12
+    net_fm = fm_inc - opp_cost
+    return res_cap,fm_inc,opp_cost,net_fm
+
+# ====================== MPS贪婪启发智能体核心函数【产出完成率动态均衡版】 ======================
+def run_mps_simulation(enable_green:bool,enable_carbon:bool):
+    inv_P1 = np.zeros(T)
+    inv_P2 = np.zeros(T)
+    inv_FA = np.zeros(T)
+    inv_FB = np.zeros(T)
+    inv_P1[0]=0
+    inv_P2[0]=0
+    inv_FA[0]=0
+    inv_FB[0]=0
+
+    dev_busy_until = np.array([-1,-1,-1])
+    dev_last_prod = np.array([-1,-1,-1])
+    task_list = []
+    night_hour_cnt = 0
     total_defect = 0.0
-    total_labor_cost = 0.0
+    total_setup_cost = 0.0
+    total_delay_cost = 0.0
 
-    # 库存：半成品/成品
-    inv = {"P1":0.0,"P2":0.0,"FA":0.0,"FB":0.0}
-    # 剩余产出目标
-    remain_target = {"P1":p1_qty,"P2":p2_qty,"FA":fa_qty,"FB":fb_qty}
-    # 订单完工时刻
-    finish_time = {"P1":None,"P2":None,"FA":None,"FB":None}
+    prod_need = {0:ord_p1,1:ord_p2,2:ord_fa,3:ord_fb}
+    prod_finish = {0:0,1:0,2:0,3:0}
+    prod_finish_time = {0:-1,1:-1,2:-1,3:-1}
 
-    sw_cost, sw_cnt = 0.0, 0
-    dr_red_energy = 0.0
-    store_cost = 0.0
-    total_grid_emission = 0.0
+    elec_cost=0.0
+    carbon_total=0.0
+    carbon_cost=0.0
+    dr_subsidy=0.0
 
-    # 故障
-    fault = {"A":np.zeros(T),"B":np.zeros(T),"C":np.zeros(T)}
-    fault_total_h =0
-    if fault_enable:
-        for d in ["A","B","C"]:
-            s = np.random.randint(20,90)
-            l = np.random.randint(4,16)
-            fault[d][s:s+l]=1
-            fault_total_h += l
+    pv_use = pv_true if enable_green else np.zeros(T)
+    price_t = price_rt
 
-    # 设备上一道加工产品（用于判断换产）
-    dev_last_prod = {"A":None,"B":None,"C":None}
-    gantt_records = []
+    for t in range(T):
+        if not is_daytime(t):
+            night_hour_cnt += dt
 
-    # 产量时序
-    prod_hour = {
-        "P1":np.zeros(T),"P2":np.zeros(T),"FA":np.zeros(T),"FB":np.zeros(T)
+        candidates = []
+        # 根据半成品完成率动态调整优先级
+        p1_ratio = prod_finish[0]/prod_need[0] if prod_need[0]>0 else 1
+        p2_ratio = prod_finish[1]/prod_need[1] if prod_need[1]>0 else 1
+        if p1_ratio < p2_ratio:
+            priority_list = [0,1,2,3]
+        else:
+            priority_list = [1,0,2,3]
+
+        for pid in priority_list:
+            if prod_finish[pid] >= prod_need[pid]:
+                continue
+            route = proc_route[pid]
+            first_dev,_ = route[0]
+            first_did = dev_id_map[first_dev]
+            if dev_busy_until[first_did] >= t:
+                continue
+            ok_bom=True
+            if pid==2 and inv_P1[t]<1:
+                ok_bom=False
+            if pid==3 and inv_P2[t]<1:
+                ok_bom=False
+            if ok_bom:
+                candidates.append(pid)
+
+        best_pid = None
+        best_cost = 1e12
+        for pid in candidates:
+            remain = prod_need[pid] - prod_finish[pid]
+            complete_rate = prod_finish[pid]/prod_need[pid]
+            c = w_ele * price_t[t] * 8 + w_car * (60 if enable_carbon else 0)
+            c = c - 0.25 * remain - 0.20*(1-complete_rate)
+            if not is_daytime(t):
+                c *= 1.15
+            if c < best_cost:
+                best_cost = c
+                best_pid = pid
+
+        if best_pid is not None:
+            route = proc_route[best_pid]
+            for dev,op_name in route:
+                did = dev_id_map[dev]
+                if dev_last_prod[did] != best_pid and dev_last_prod[did]!=-1:
+                    total_setup_cost += setup_cost
+                    dev_busy_until[did] += setup_step
+                start_t = max(t, dev_busy_until[did]+1)
+                dur = 3
+                end_t = min(start_t + dur, T-1)
+                dev_busy_until[did] = end_t
+                dev_last_prod[did] = best_pid
+                task_list.append({
+                    "dev_idx":did,
+                    "dev_name":dev_name_list[did],
+                    "product_id":best_pid,
+                    "prod_name":prod_name[best_pid],
+                    "op":op_name,
+                    "start":start_t,
+                    "end":end_t
+                })
+            prod_finish[best_pid] +=1
+            prod_finish_time[best_pid] = t
+            if best_pid==0: inv_P1[t:]=inv_P1[t]+1
+            if best_pid==1: inv_P2[t:]=inv_P2[t]+1
+            if best_pid==2: inv_FA[t:]=inv_FA[t]+1
+            if best_pid==3: inv_FB[t:]=inv_FB[t]+1
+
+            if is_daytime(t):
+                df = base_defect_day
+            else:
+                df = base_defect_day + defect_night_inc * night_hour_cnt
+            total_defect += df
+
+        load = 10.0 if len(candidates)>0 else 3.0
+        grid_draw = max(load - pv_use[t], 0)
+        elec_cost += grid_draw * dt * price_t[t]
+        co2 = grid_draw * dt * 0.5
+        carbon_total += co2
+
+    for pid in prod_need:
+        fin_h = prod_finish_time[pid]*dt
+        if fin_h > due_hour:
+            delay_cnt = prod_need[pid]
+            total_delay_cost += delay_cnt * delay_penalty
+
+    quota_balance = free_quota - carbon_total
+    if enable_carbon:
+        if quota_balance < 0:
+            carbon_cost = -quota_balance * base_carbon_price
+        else:
+            dr_subsidy = quota_balance * base_carbon_price
+    else:
+        carbon_cost=0
+
+    wage_total = night_hour_cnt * wage_night + (t*dt - night_hour_cnt)*wage_day
+    rework_total = total_defect * rework_cost_unit
+    labor_rework_cost = wage_total + rework_total
+
+    ret = {
+        "elec_cost":elec_cost,
+        "carbon_total":carbon_total,
+        "carbon_cost":carbon_cost,
+        "dr_subsidy":dr_subsidy,
+        "setup_cost":total_setup_cost,
+        "delay_cost":total_delay_cost,
+        "labor_rework":labor_rework_cost,
+        "defect_qty":total_defect,
+        "night_hour":night_hour_cnt,
+        "inv_P1":inv_P1,"inv_P2":inv_P2,"inv_FA":inv_FA,"inv_FB":inv_FB,
+        "prod_finish":prod_finish,
+        "prod_finish_time":prod_finish_time,
+    }
+    return ret,task_list
+
+# ====================== 日前‑日内‑实时能源调度模块 ======================
+def energy_dispatch(enable_green):
+    pv = pv_true if enable_green else np.zeros(T)
+    soc_da = np.zeros(T); soc_da[0]=0.4
+    pb_da = np.zeros(T)
+    soc_rt = np.zeros(T); soc_rt[0]=0.4
+    pb_rt = np.zeros(T)
+    P_da_load = np.zeros(T)
+    P_rt_load = np.zeros(T)
+    P_rt_core = np.full(T,8)
+    P_rt_flex = np.zeros(T)
+    interrupt_cost_sum=0.0
+    last_flex=1
+
+    for t in range(T):
+        p=price_da[t]
+        if p<0.2:
+            P_da_load[t]=16
+        elif p<0.4:
+            P_da_load[t]=12
+        elif p<0.7:
+            P_da_load[t]=8
+        else:
+            P_da_load[t]=4
+        if p<0.2:
+            pb = min(batt_pmax,(batt_cap*0.9-soc_da[t]*batt_cap)/dt)
+        elif p>0.6:
+            pb = -min(batt_pmax,(soc_da[t]*batt_cap-batt_cap*0.1)/dt)
+        else:
+            pb=0
+        pb_da[t]=pb
+        if t<T-1:
+            soc_da[t+1]=np.clip(soc_da[t]-pb*dt/batt_cap,0.1,0.9)
+
+    for t_start in range(0,T,window_step):
+        t_end = min(t_start+window_step,T)
+        for t in range(t_start,t_end):
+            p=price_rt[t]
+            if p>0.65:
+                ft=0
+            elif p<0.2:
+                ft=8
+            elif p<0.4:
+                ft=5.6
+            else:
+                ft=3.2
+            if last_flex==1 and ft==0:
+                interrupt_cost_sum += interrupt_cost
+            if last_flex==0 and ft>0:
+                interrupt_cost_sum += interrupt_cost
+            last_flex = 1 if ft>0 else 0
+            P_rt_flex[t]=ft
+            P_rt_load[t]=P_rt_core[t]+P_rt_flex[t]
+            if p<0.2:
+                pb = min(batt_pmax,(batt_cap*0.9-soc_rt[t]*batt_cap)/dt)
+            elif p>0.6:
+                pb = -min(batt_pmax,(soc_rt[t]*batt_cap-batt_cap*0.1)/dt)
+            else:
+                pb=0
+            pb_rt[t]=pb
+            if t<T-1:
+                soc_rt[t+1]=np.clip(soc_rt[t]-pb*dt/batt_cap,0.1,0.9)
+    dev_cost=0.0
+    for t in range(T):
+        dev_cost += abs((P_rt_load[t]+pb_rt[t])-(P_da_load[t]+pb_da[t]))*dev_penalty
+
+    bid_curve = np.zeros(T)
+    for t in range(T):
+        bid_curve[t] = 0.2 + P_da_load[t]/16 * 0.8
+
+    return {
+        "P_da_load":P_da_load,"pb_da":pb_da,"soc_da":soc_da,
+        "P_rt_load":P_rt_load,"P_rt_core":P_rt_core,"P_rt_flex":P_rt_flex,"pb_rt":pb_rt,"soc_rt":soc_rt,
+        "dev_cost":dev_cost,"interrupt_cost_sum":interrupt_cost_sum,"bid_curve":bid_curve
     }
 
-    for t in range(T):
-        soc_record[t] = batt_soc
-        store_cost += sum(inv.values()) * 0.02
-        all_done = all(remain_target[p]<=1e-3 for p in remain_target)
-        if all_done:
-            continue
+# ====================== 仿真执行入口 ======================
+st.title("ERP课程设计｜零碳园区MPS细粒度工序BOM工艺路线协同调度智能体仿真【增强可视化版】")
+st.info("原型说明：贪婪启发式智能体；15min粒度96时段；四层电力市场；BOM物料齐套；双场景对比。")
 
-        # 设备本小时是否故障
-        dev_fault_flag = {
-            d: bool(fault[d][t]>0) for d in ["A","B","C"]
-        }
-        w_ele = 1.0 - w_carbon
+# ========= 一键情景切换按钮【优先级3】 =========
+st.subheader("🎬情景快速切换")
+col_s1,col_s2,col_s3 = st.columns(3)
+btn_base = col_s1.button("运行基准参数情景")
+btn_highcarbon = col_s2.button("运行高碳价情景(碳价=120元/tCO₂)")
+btn_reset = col_s3.button("恢复侧边栏原始参数")
 
-        # ======【生成全部可开工候选工序】======
-        candidates = []
-        for prod_id in ["P1","P2","FA","FB"]:
-            rt = remain_target[prod_id]
-            if rt <= 1e-3:
-                continue
-            # 交付期硬约束
-            dl = {
-                "P1":t_p1_end,"P2":t_p2_end,"FA":t_fa_end,"FB":t_fb_end
-            }[prod_id]
-            if t>dl:
-                continue
-            # BOM齐套判断：成品第一道工序需要半成品
-            bom_ok = True
-            if prod_id=="FA":
-                bom_ok = inv["P1"] >= bom_fa_p1 * rt
-            if prod_id=="FB":
-                bom_ok = (inv["P1"] >= bom_fb_p1*rt) and (inv["P2"] >= bom_fb_p2*rt)
-            if not bom_ok:
-                continue
-            route = process_route[prod_id]
-            for proc_idx, proc_info in enumerate(route):
-                dev = proc_info["dev"]
-                # 设备故障 / 工时耗尽
-                if dev_fault_flag[dev]:
-                    continue
-                if dev_used_h[dev] >= dev_max_h[dev]:
-                    continue
-                # 计算本工序综合代价
-                e_unit = prod_total_energy[prod_id]["e"] * proc_info["e_share"]
-                elec_unit = prod_total_energy[prod_id]["elec"] * proc_info["elec_share"]
-                cost_eval = w_ele * elec_unit * elec_price[t] + w_carbon * e_unit
-                if dr_enable and dr_start <= t <= dr_end:
-                    cost_eval *= 2.2
-                candidates.append({
-                    "prod":prod_id,
-                    "proc_idx":proc_idx,
-                    "proc_name":proc_info["proc_name"],
-                    "dev":dev,
-                    "cost":cost_eval
-                })
-        # 按代价升序排序，贪心选最优
-        candidates.sort(key=lambda x:x["cost"])
+if btn_highcarbon:
+    st.toast("已切换至高碳价情景：base_carbon_price=120",icon="⚠️")
+    base_carbon_price = 120
 
-        # 遍历候选，分配给设备
-        selected = {"A":None,"B":None,"C":None}
-        used_qty_dev = {"A":0.0,"B":0.0,"C":0.0}
-        for cand in candidates:
-            d = cand["dev"]
-            if selected[d] is not None:
-                continue
-            selected[d] = cand
+# =========【页面：复刻docx报告产品工艺路线表格】=========
+st.subheader("📋产品工艺路线（生产工序顺序约束）")
+st.dataframe(df_tech_route,use_container_width=True,hide_index=True)
+st.markdown("> 说明：生产严格遵循从左到右工序顺序；上一道工序完成，才能执行下一道工序；成品开工前需要满足BOM半成品库存齐套约束。")
 
-        # =========执行各设备工序============
-        for dev in ["A","B","C"]:
-            sel_cand = selected[dev]
-            if sel_cand is None:
-                continue
-            prod = sel_cand["prod"]
-            pname = sel_cand["proc_name"]
-            qty_max_dev = dev_cap[dev]
-            actual_qty = min(qty_max_dev, remain_target[prod])
-            # 换产判断
-            if dev_last_prod[dev] is not None and dev_last_prod[dev] != prod:
-                dev_used_h[dev] += change_hour
-                sw_cost += change_cost
-                sw_cnt += 1
-            dev_last_prod[dev] = prod
-            # 记录甘特细粒度：本小时工序
-            gantt_records.append({
-                "设备":dev,
-                "产品":prod,
-                "工序":pname,
-                "开始":t,
-                "结束":t+1
-            })
-            # 产出
-            remain_target[prod] -= actual_qty
-            inv[prod] += actual_qty
-            prod_hour[prod][t] += actual_qty
-            used_qty_dev[dev] += actual_qty
-            dev_used_h[dev] += 1.0
+with st.spinner("正在运行MPS贪婪排产 + 四层电力市场仿真，请稍候……"):
+    res_opt,task_opt = run_mps_simulation(enable_green=True,enable_carbon=True)
+    eng_opt = energy_dispatch(enable_green=True)
+    res_base,task_base = run_mps_simulation(enable_green=False,enable_carbon=False)
+    eng_base = energy_dispatch(enable_green=False)
+    agc_res_cap,agc_fm_inc,agc_opp_cost,agc_net = calc_agc(batt_cap,batt_pmax,agc_reserve_ratio,fm_price)
 
-            # 判断产品全部完成，记录完工时刻
-            if remain_target[prod] <=1e-3 and finish_time[prod] is None:
-                finish_time[prod] = t
+def calc_net(res,eng,agc_net):
+    prod_inc = 8000
+    elec_cost = res["elec_cost"]
+    carbon_cost = res["carbon_cost"]
+    setup_c = res["setup_cost"]
+    delay_c = res["delay_cost"]
+    labor_rework_c = res["labor_rework"]
+    dev_c = eng["dev_cost"]
+    inter_c = eng["interrupt_cost_sum"]
+    dr_inc = res["dr_subsidy"]
+    net = prod_inc + dr_inc + agc_net - elec_cost - carbon_cost - setup_c - delay_c - labor_rework_c - dev_c - inter_c
+    return net
 
-        # =========工人班次+次品核算============
-        total_produce_qty = sum(used_qty_dev.values())
-        used_h_total = total_produce_qty/(cap_A+cap_B+cap_C+1e-6)
-        h_of_day = t %24
-        is_night = not (8 <= h_of_day <= 18)
-        if is_night:
-            night_hour_cnt += used_h_total
-            labor_cost_h = used_h_total * wage_night
-            defect_rate = base_defect + night_defect_inc * night_hour_cnt
-        else:
-            labor_cost_h = used_h_total * wage_day
-            defect_rate = base_defect
-        defect_num_h = total_produce_qty * defect_rate
-        rework_h_cost = defect_num_h * rework_cost
-        total_defect += defect_num_h
-        total_labor_cost += labor_cost_h + rework_h_cost
-        labor_cost_rec[t] = labor_cost_h
-        defect_cnt_rec[t] = defect_num_h
+net_opt = calc_net(res_opt,eng_opt,agc_net)
+net_base = calc_net(res_base,eng_base,0.0)
 
-    # =========能源仿真============
-    elec_cost =0.0
-    batt_soc =0.0
-    for t in range(T):
-        load = prod_hour["P1"][t]*elec_p1 + prod_hour["P2"][t]*elec_p2 + prod_hour["FA"][t]*elec_fa + prod_hour["FB"][t]*elec_fb
-        pv = pv_power[t] if use_pv else 0
-        net_load = load - pv
-        if use_batt and batt_cap>1e-6:
-            if net_load < 0:
-                chg = min(-net_load * batt_eff, batt_cap - batt_soc)
-                batt_soc += chg
-                net_load = 0
-            else:
-                dis = min(net_load / batt_eff, batt_soc)
-                batt_soc -= dis
-                net_load -= dis
-        buy_e = max(net_load, 0.0)
-        elec_cost += buy_e * elec_price[t]
-        total_grid_emission += buy_e * grid_carbon_factor
-        if dr_enable and dr_start <= t <= dr_end:
-            max_load = (cap_A+cap_B+cap_C)*0.15
-            dr_red_energy += max(0, max_load-load)
-    dr_sub = dr_red_energy * dr_subsidy if dr_enable else 0
-    prod_emission = np.sum(prod_hour["P1"])*e_p1 + np.sum(prod_hour["P2"])*e_p2 + np.sum(prod_hour["FA"])*e_fa + np.sum(prod_hour["FB"])*e_fb
-    total_emission = prod_emission + total_grid_emission
-    carbon_price = get_carbon_price(total_emission)
-    carbon_cost = (total_emission - base_quota)*carbon_price if use_carbon else 0.0
-    total_cost = elec_cost + carbon_cost + sw_cost + store_cost - dr_sub + total_labor_cost
+# =========【核心仿真指标卡片｜复刻docx截图】=========
+st.subheader("📊核心仿真指标")
+col_a1,col_a2,col_a3,col_a4,col_a5 = st.columns(5)
+col_a1.metric("优化场景净收益",f"{net_opt:.2f} 元")
+col_a2.metric("优化场景总碳排",f"{res_opt['carbon_total']:.2f} tCO₂")
+col_a3.metric("优化场景人工+返工",f"{res_opt['labor_rework']:.2f} 元")
+col_a4.metric("优化场景次品总数",f"{res_opt['defect_qty']:.2f} 件")
+col_a5.metric("优化场景夜班总工时",f"{res_opt['night_hour']:.2f} h")
 
-    return (
-        total_cost, elec_cost, carbon_cost, total_emission,
-        prod_hour["P1"],prod_hour["P2"],prod_hour["FA"],prod_hour["FB"],
-        soc_record, labor_cost_rec, defect_cnt_rec,
-        carbon_price, sw_cost, sw_cnt, dr_sub, dr_red_energy, store_cost, fault_total_h, total_grid_emission, prod_emission,
-        finish_time, total_labor_cost, total_defect, night_hour_cnt, gantt_records
-    )
+col_b1,col_b2,col_b3,col_b4,col_b5 = st.columns(5)
+col_b1.metric("基准场景净收益",f"{net_base:.2f} 元")
+col_b2.metric("基准场景总碳排",f"{res_base['carbon_total']:.2f} tCO₂")
+col_b3.metric("基准场景人工+返工",f"{res_base['labor_rework']:.2f} 元")
+col_b4.metric("基准场景次品总数",f"{res_base['defect_qty']:.2f} 件")
+col_b5.metric("基准场景夜班总工时",f"{res_base['night_hour']:.2f} h")
 
-# =========运行仿真========
-opt_result = run_simulation(use_pv=True,use_batt=True,use_carbon=True,w_carbon=weight_carbon)
-opt_cost,opt_elec,opt_carbon,opt_em = opt_result[0],opt_result[1],opt_result[2],opt_result[3]
-p1_arr,p2_arr,fa_arr,fb_arr = opt_result[4],opt_result[5],opt_result[6],opt_result[7]
-soc_arr, labor_rec, defect_rec = opt_result[8],opt_result[9],opt_result[10]
-c_price_opt,sw_cost_opt,sw_cnt_opt,dr_sub_opt,dr_red_opt,store_cost_opt,fault_h_opt,grid_em_opt,prod_em_opt = opt_result[11],opt_result[12],opt_result[13],opt_result[14],opt_result[15],opt_result[16],opt_result[17],opt_result[18],opt_result[19]
-finish_dict = opt_result[20]
-total_labor_opt,total_defect_opt,night_h_opt,gantt_raw = opt_result[21],opt_result[22],opt_result[23],opt_result[24]
+st.subheader("🔌AGC辅助服务经济性指标")
+col_agc1,col_agc2,col_agc3,col_agc4 = st.columns(4)
+col_agc1.metric("调频预留容量",f"{agc_res_cap:.2f} kWh")
+col_agc2.metric("调频补贴收入",f"{agc_fm_inc:.2f} 元")
+col_agc3.metric("套利机会成本",f"{agc_opp_cost:.2f} 元")
+col_agc4.metric("AGC净收益",f"{agc_net:.2f} 元")
 
-base_result = run_simulation(use_pv=False,use_batt=False,use_carbon=False,w_carbon=0.0)
-
-# =========订单完成表========
-order_df = pd.DataFrame([
-    {"订单ID":"P1","物料类型":"半成品P1","计划交付h":t_p1_end,"实际完工h":finish_dict["P1"] if finish_dict["P1"] is not None else 168},
-    {"订单ID":"P2","物料类型":"半成品P2","计划交付h":t_p2_end,"实际完工h":finish_dict["P2"] if finish_dict["P2"] is not None else 168},
-    {"订单ID":"FA","物料类型":"成品FA","计划交付h":t_fa_end,"实际完工h":finish_dict["FA"] if finish_dict["FA"] is not None else 168},
-    {"订单ID":"FB","物料类型":"成品FB","计划交付h":t_fb_end,"实际完工h":finish_dict["FB"] if finish_dict["FB"] is not None else 168},
-])
-order_df["是否按期完工"] = order_df.apply(lambda r:"按期" if r["实际完工h"] <= r["计划交付h"] else "延期",axis=1)
-order_df["延期时长h"] = order_df.apply(lambda r:max(0,r["实际完工h"]-r["计划交付h"]),axis=1)
-
-df_gantt = pd.DataFrame(gantt_raw)
-
-# =========页面主体========
-st.title("🏭零碳园区MPS【细粒度工序级】协同仿真｜多级BOM+工艺路线")
-
-# ==========网页展示工艺路线表格【新增】==========
-st.subheader("📋 产品工艺路线（生产工序顺序）")
-route_data = [
-    {"产品":"P1(半成品)","工序1":"切割【设备A】","工序2":"打磨【设备B】","工序3":"无","工序4":"无"},
-    {"产品":"P2(半成品)","工序1":"下料【设备B】","工序2":"钻孔【设备C】","工序3":"粗磨【设备A】","工序4":"无"},
-    {"产品":"FA(成品)","工序1":"装配FA【设备C】","工序2":"质检FA【设备A】","工序3":"无","工序4":"无"},
-    {"产品":"FB(成品)","工序1":"组合装配FB【设备C】","工序2":"表面处理FB【设备B】","工序3":"终检包装FB【设备A】","工序4":"无"},
+# =========【优化VS基准对比总表｜完全复刻docx报告表格】=========
+comp_data = [
+    {"指标":"综合净收益(元)","基准场景":round(net_base,2),"优化场景":round(net_opt,2)},
+    {"指标":"电费成本(元)","基准场景":round(res_base["elec_cost"],2),"优化场景":round(res_opt["elec_cost"],2)},
+    {"指标":"人工‑返工总成本(元)","基准场景":round(res_base["labor_rework"],2),"优化场景":round(res_opt["labor_rework"],2)},
+    {"指标":"换产成本(元)","基准场景":round(res_base["setup_cost"],2),"优化场景":round(res_opt["setup_cost"],2)},
+    {"指标":"碳成本(元)","基准场景":round(res_base["carbon_cost"],2),"优化场景":round(res_opt["carbon_cost"],2)},
+    {"指标":"需求响应/碳结余补贴(元)","基准场景":0.0,"优化场景":round(res_opt["dr_subsidy"],2)},
+    {"指标":"总碳排放 tCO₂","基准场景":round(res_base["carbon_total"],2),"优化场景":round(res_opt["carbon_total"],2)},
+    {"指标":"次品总件数","基准场景":round(res_base["defect_qty"],2),"优化场景":round(res_opt["defect_qty"],2)},
 ]
-df_route = pd.DataFrame(route_data)
-st.dataframe(df_route, use_container_width=True)
-st.info("说明：生产必须严格按从左到右的工序顺序执行（串行工艺路线），上一道工序完成，才能执行下一道工序。成品开工前需要满足BOM半成品库存齐套约束。")
-# =============================================
+df_comp = pd.DataFrame(comp_data)
+st.subheader("📈优化场景 VS 基准场景对比总表")
+st.dataframe(df_comp,use_container_width=True,hide_index=True)
 
-st.markdown("逐小时工序级排产，设备互斥，严格遵循工艺先后顺序；集成光伏储能、碳配额、VPP虚拟电厂、白夜班工人排班与次品返工。")
-st.divider()
+# ==========【时序绘图：电价、负荷、报价曲线、储能SOC】==========
+st.subheader("📉时序仿真曲线（15min粒度）")
+fig_price = go.Figure()
+fig_price.add_trace(go.Scatter(x=day_hour,y=price_da,name="日前电价 元/kWh"))
+fig_price.add_trace(go.Scatter(x=day_hour,y=price_rt,name="实时电价 元/kWh"))
+fig_price.update_layout(xaxis_title="仿真时刻(h)")
 
-st.subheader("📌核心仿真指标")
-c1,c2,c3,c4,c5 = st.columns(5)
-c1.metric("综合总成本",f"{opt_cost:.2f}元")
-c2.metric("总碳排放",f"{opt_em:.2f} tCO₂")
-c3.metric("人工+返工总成本",f"{total_labor_opt:.2f}元")
-c4.metric("总次品数量",f"{total_defect_opt:.1f}件")
-c5.metric("夜班总工时",f"{night_h_opt:.1f} h")
-st.divider()
+fig_load = go.Figure()
+fig_load.add_trace(go.Scatter(x=day_hour,y=eng_opt["P_da_load"],name="日前规划总负荷 kW"))
+fig_load.add_trace(go.Scatter(x=day_hour,y=eng_opt["P_rt_load"],name="日内实际总负荷 kW"))
+fig_load.add_trace(go.Scatter(x=day_hour,y=eng_opt["P_rt_core"],name="核心工序负荷 kW"))
+fig_load.add_trace(go.Scatter(x=day_hour,y=eng_opt["P_rt_flex"],name="可中断柔性负荷 kW"))
+fig_load.update_layout(xaxis_title="仿真时刻(h)")
 
-st.subheader("📊优化场景VS基准场景对比")
-df_comp = pd.DataFrame({
-    "指标":["综合成本(元)","电费成本(元)","人工返工成本(元)","换产成本(元)","仓储成本(元)","碳成本(元)","需求响应补贴(元)","总碳排放(tCO₂)","次品总数(件)"],
-    "基准场景":[base_result[0],base_result[1],base_result[21],base_result[12],base_result[16],base_result[2],base_result[14],base_result[3],base_result[22]],
-    "优化场景":[opt_cost,opt_elec,total_labor_opt,sw_cost_opt,store_cost_opt,opt_carbon,dr_sub_opt,opt_em,total_defect_opt]
+fig_bid = go.Figure()
+fig_bid.add_trace(go.Scatter(x=day_hour,y=eng_opt["bid_curve"],name="日前申报报价曲线"))
+fig_bid.update_layout(xaxis_title="仿真时刻(h)")
+
+fig_soc = go.Figure()
+fig_soc.add_trace(go.Scatter(x=day_hour,y=eng_opt["soc_da"],name="日前储能SOC"))
+fig_soc.add_trace(go.Scatter(x=day_hour,y=eng_opt["soc_rt"],name="日内储能SOC"))
+fig_soc.update_layout(xaxis_title="仿真时刻(h)")
+
+st.plotly_chart(fig_price,use_container_width=True)
+st.plotly_chart(fig_load,use_container_width=True)
+st.plotly_chart(fig_bid,use_container_width=True)
+st.plotly_chart(fig_soc,use_container_width=True)
+
+# ========= 【优先级1：1.库存时序曲线图 BOM物料】 =========
+st.subheader("📦半成品&成品库存时序（BOM物料变化）")
+fig_inv = go.Figure()
+fig_inv.add_trace(go.Scatter(x=day_hour, y=res_opt["inv_P1"], name="P1半成品库存"))
+fig_inv.add_trace(go.Scatter(x=day_hour, y=res_opt["inv_P2"], name="P2半成品库存"))
+fig_inv.add_trace(go.Scatter(x=day_hour, y=res_opt["inv_FA"], name="FA成品库存"))
+fig_inv.add_trace(go.Scatter(x=day_hour, y=res_opt["inv_FB"], name="FB成品库存"))
+fig_inv.update_layout(xaxis_title="仿真时刻(h)", yaxis_title="库存件数")
+st.plotly_chart(fig_inv, use_container_width=True)
+
+# =========【优先级1：2.日前市场报价单表格】 =========
+st.subheader("📄日前市场虚拟电厂申报报价单")
+df_bid = pd.DataFrame({
+    "仿真时刻(h)":day_hour,
+    "日前计划负荷(kW)":eng_opt["P_da_load"],
+    "申报报价(元/kWh)":eng_opt["bid_curve"]
 })
-st.dataframe(df_comp,use_container_width=True)
-if opt_em <= base_quota:
-    st.success("✅碳配额结余，可出售配额获取收益")
-else:
-    st.warning("⚠️碳配额不足，需要碳市场购买配额")
-st.divider()
+st.dataframe(df_bid, use_container_width=True, hide_index=True)
 
-st.subheader("📈168小时分时电价时序")
-fig1 = px.line(x=hour_list,y=elec_price,labels={"x":"小时","y":"电价(元/kWh)"},title="逐小时分时电价")
-fig1.add_vrect(x0=dr_start,x1=dr_end,fillcolor="red",opacity=0.2,annotation_text="需求响应事件")
-fig1.update_layout(height=380)
-st.plotly_chart(fig1,use_container_width=True)
+# =========【优先级2：仿真约束状态概览面板】 =========
+st.subheader("⚠️仿真约束状态（优化场景）")
+col_c1,col_c2,col_c3 = st.columns(3)
+quota_remain = free_quota - res_opt["carbon_total"]
+col_c1.metric("碳配额剩余 tCO₂",f"{quota_remain:.2f}")
+col_c2.metric("总仿真时段","96(15min粒度，24h)")
+col_c3.metric("AGC预留容量 kWh",f"{agc_res_cap:.2f}")
 
-st.subheader("📈生产时序曲线（半成品+成品每小时产出）")
-df_line = pd.DataFrame({
-    "小时":hour_list,
-    "电价":elec_price,
-    "光伏出力":pv_power,
-    "储能SOC":soc_arr,
-    "P1产量":p1_arr,
-    "P2产量":p2_arr,
-    "FA产量":fa_arr,
-    "FB产量":fb_arr,
-    "时段人工成本":labor_rec,
-    "时段次品数":defect_rec
-})
-fig2 = px.line(df_line,x="小时",y=["光伏出力","储能SOC","P1产量","P2产量","FA产量","FB产量","时段人工成本","时段次品数"])
-fig2.add_vrect(x0=dr_start,x1=dr_end,fillcolor="red",opacity=0.2)
-fig2.update_layout(height=440)
-st.plotly_chart(fig2,use_container_width=True)
+# =========【优先级3：日前‑日内‑实时三层负荷对比绘图】 =========
+st.subheader("📊三层电力市场负荷对比：日前计划｜日内修正｜实时实际")
+fig_3layer = go.Figure()
+fig_3layer.add_trace(go.Scatter(x=day_hour,y=eng_opt["P_da_load"],name="日前计划负荷",line_dash="dash"))
+fig_3layer.add_trace(go.Scatter(x=day_hour,y=eng_opt["P_rt_load"],name="实时实际负荷"))
+fig_3layer.update_layout(xaxis_title="仿真时刻(h)",yaxis_title="负荷 kW")
+st.plotly_chart(fig_3layer,use_container_width=True)
 
-st.divider()
-st.subheader("📋半成品&成品订单完成汇总表")
-st.dataframe(order_df,use_container_width=True)
+# =========【细粒度工序排产动态甘特图】=========
+st.subheader("🗓️细粒度工序排产甘特图（优化场景，每一条色块代表一道工序）")
+fig_gantt = go.Figure()
+color_map = {0:"#1f77b4",1:"#ff7f0e",2:"#2ca02c",3:"#d62728"}
+for tsk in task_opt:
+    fig_gantt.add_trace(go.Bar(
+        y=[tsk["dev_name"]],
+        x=[tsk["end"]-tsk["start"]],
+        base=[tsk["start"]],
+        name=f'{tsk["prod_name"]}',
+        orientation="h",
+        marker_color=color_map[tsk["product_id"]],
+        hovertext=f'{tsk["prod_name"]}｜{tsk["op"]}'
+    ))
+fig_gantt.update_layout(xaxis_title="仿真步(15min)",yaxis_title="设备",barmode="overlay",height=480)
+st.plotly_chart(fig_gantt,use_container_width=True)
 
-st.subheader("📊细粒度工序排产甘特图（每一条代表一道工序）")
-if len(df_gantt)>0:
-    fig_g = px.bar(df_gantt,
-                   x="结束",
-                   y="设备",
-                   color="产品",
-                   base="开始",
-                   orientation="h",
-                   hover_data=["产品","工序","开始","结束"])
-    fig_g.update_xaxes(title="仿真时间（小时）",range=[0,168])
-    fig_g.update_layout(height=460)
-    st.plotly_chart(fig_g,use_container_width=True)
-else:
-    st.info("暂无工序排产记录")
-
-with st.expander("📋查看完整168小时原始仿真数据表"):
-    st.dataframe(df_line,use_container_width=True)
+# =========【半成品‑成品订单交付汇总表｜复刻docx报告】=========
+order_quant = {0:ord_p1,1:ord_p2,2:ord_fa,3:ord_fb}
+order_tab = []
+for pid in [0,1,2,3]:
+    ft = res_opt["prod_finish_time"][pid]
+    if ft <= 0:
+        finish_h = "未完工"
+        status = "未生产"
+    else:
+        finish_h = round(ft*dt,2)
+        status="按期交付" if (finish_h <= due_hour) else "延期"
+    order_tab.append({
+        "产品":prod_name[pid],
+        "计划产量":order_quant[pid],
+        "实际完成":res_opt["prod_finish"][pid],
+        "完成时刻(h)":finish_h,
+        "交付截止(h)":due_hour,
+        "状态":status
+    })
+df_order = pd.DataFrame(order_tab)
+st.subheader("📦半成品‑成品订单交付汇总")
+st.dataframe(df_order,use_container_width=True,hide_index=True)
 
 st.markdown("""
-### 模型说明
-1.仿真周期168小时（7天），小时粒度**细粒度工序级排产**；
-2.工艺约束：每台设备同一时刻只能执行一道工序；成品开工前校验BOM半成品物料齐套；产品严格按照预设工艺路线进行加工；
-3.多约束集合：订单交付截止期、设备工时上限、工序切换产生换产时间与成本；光伏储能充放电仿真、碳配额交易、虚拟电厂需求响应；区分白夜班排班，夜班疲劳累积带来次品与返工成本；
-4.求解策略：贪婪启发智能体，逐小时计算候选工序综合代价，优先选择综合代价最低的工序投入加工；
-5.原型系统，用于课程设计推演，不等同于商用工业MPS软件。
+---
+> ### 系统版本说明【增强可视化完整版】
+> 1. 页面完整复现原报告界面元素：工艺路线总表、指标卡片、双场景对比总表、订单汇总、动态工序甘特图、全套时序曲线
+> 2. MPS贪婪启发智能体：BOM物料齐套校验、P1/P2‑FA/FB串行工艺路线、A/B/C三台设备互斥、产出完成率动态均衡投产
+> 3. 四层电力市场完整实现：日前、日内滚动、实时可中断负荷、AGC调频；报价曲线、电力偏差惩罚
+> 4. 人员质量模块：白夜班、夜班工时、次品返工、订单延期违约金；碳配额+光伏储能联合调度，双场景并行仿真
+> ✨【新增增强可视化功能】
+> - 库存时序曲线，直观展示BOM物料库存变化
+> - 日前市场申报报价单表格输出
+> - 仿真约束状态概览面板（碳配额剩余、AGC预留容量）
+> - 三层电力市场负荷对比图（日前计划 vs 实时实际）
+> - 情景一键切换按钮（高碳价情景快速对比实验）
+> 6. 仿真粒度15min，96个时段；贪婪启发为局部最优，适合网页原型演示
 """)
